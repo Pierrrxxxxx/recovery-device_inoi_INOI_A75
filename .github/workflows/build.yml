@@ -1,15 +1,21 @@
-name: Build and Release All Recoveries INOI A75
+name: Build Multi-Recovery INOI A75
 
 on:
   workflow_dispatch:
+    inputs:
+      recovery_type:
+        description: "Select recovery to build"
+        required: true
+        default: "twrp"
+        type: choice
+        options:
+          - twrp
+          - pbrp
+          - ofox
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        recovery: [twrp, pbrp, ofox]
 
     steps:
       - name: Checkout device tree
@@ -23,11 +29,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt update
-          sudo apt install -y bc build-essential curl python3 openjdk-11-jdk ccache rsync
+          sudo apt install -y bc build-essential curl python3 openjdk-11-jdk ccache rsync zip
 
       - name: Setup 24GB swap
         run: |
-          sudo swapoff -a
+          sudo swapoff -a || true
           sudo rm -f /swapfile
           sudo dd if=/dev/zero of=/swapfile bs=1G count=24 status=progress
           sudo chmod 600 /swapfile
@@ -38,31 +44,29 @@ jobs:
 
       - name: Install repo tool
         run: |
-          curl https://storage.googleapis.com/git-repo-downloads/repo -o repo
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o repo
           chmod +x repo
-          sudo mv repo /usr/local/bin/
+          sudo mv repo /usr/local/bin/repo
 
-      - name: Build ${{ matrix.recovery }}
+      - name: Sync sources and build recovery
+        shell: bash
         run: |
           set +e
 
           DEVICE_CODENAME="INOI_A75"
-          DEVICE_DIR="device/inoi/$DEVICE_CODENAME"
-          RECOVERY="${{ matrix.recovery }}"
+          RECOVERY="${{ github.event.inputs.recovery_type }}"
           WORKSPACE="$GITHUB_WORKSPACE/rec_src"
+          DEVICE_DIR="device/inoi/${DEVICE_CODENAME}"
 
           mkdir -p "$WORKSPACE"
 
           if [[ "$RECOVERY" == "ofox" ]]; then
             git clone --depth=1 https://gitlab.com/OrangeFox/sync.git "$GITHUB_WORKSPACE/ofox_sync"
+
             cd "$GITHUB_WORKSPACE/ofox_sync"
             ./orangefox_sync.sh --branch 12.1 --path "$WORKSPACE"
+
             cd "$WORKSPACE"
-
-            mkdir -p "$DEVICE_DIR"
-            rsync -av --exclude='.git' --exclude='.github' \
-              "$GITHUB_WORKSPACE/device_tree/" "$DEVICE_DIR/"
-
           else
             cd "$WORKSPACE"
 
@@ -79,15 +83,20 @@ jobs:
                 ;;
             esac
 
-            repo sync -c -j$(nproc) --no-tags --no-clone-bundle --force-sync
-
-            mkdir -p "$DEVICE_DIR"
-            rsync -av --exclude='.git' --exclude='.github' \
-              "$GITHUB_WORKSPACE/device_tree/" "$DEVICE_DIR/"
+            repo sync -c -j"$(nproc)" --force-sync --no-tags --no-clone-bundle
           fi
 
+          mkdir -p "$DEVICE_DIR"
+
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            "$GITHUB_WORKSPACE/device_tree/" \
+            "$DEVICE_DIR/"
+
           export ALLOW_MISSING_DEPENDENCIES=true
-          . build/envsetup.sh
+
+          source build/envsetup.sh
 
           case "$RECOVERY" in
             twrp)
@@ -104,69 +113,50 @@ jobs:
               ;;
           esac
 
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          OUT_DIR="out/target/product/${DEVICE_CODENAME}"
+      - name: Package recovery zip
+        shell: bash
+        run: |
+          set -e
+
+          DEVICE_CODENAME="INOI_A75"
+          RECOVERY="${{ github.event.inputs.recovery_type }}"
+          OUT_DIR="$GITHUB_WORKSPACE/rec_src/out/target/product/${DEVICE_CODENAME}"
+
+          mkdir -p artifacts
+
+          ZIP_FILE="artifacts/${DEVICE_CODENAME}-${RECOVERY}.zip"
 
           if [[ "$RECOVERY" == "ofox" ]]; then
-            # Prefer any non-vendor_boot.img output; fall back to vendor_boot.img.
             shopt -s nullglob
-            imgs=("$OUT_DIR"/*.img)
-            shopt -u nullglob
 
-            named_img=""
-            for f in "${imgs[@]}"; do
-              if [[ "$(basename "$f")" != "vendor_boot.img" ]]; then
-                named_img="$f"
+            RECOVERY_IMG=""
+
+            for img in "$OUT_DIR"/*.img; do
+              if [[ "$(basename "$img")" != "vendor_boot.img" ]]; then
+                RECOVERY_IMG="$img"
                 break
               fi
             done
 
-            if [[ -n "$named_img" ]]; then
-              cp "$named_img" "$GITHUB_WORKSPACE/artifacts/"
-            elif [[ -f "$OUT_DIR/vendor_boot.img" ]]; then
-              cp "$OUT_DIR/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
-            else
-              echo "No images produced for $RECOVERY"
+            shopt -u nullglob
+
+            if [[ -z "$RECOVERY_IMG" ]]; then
+              echo "OrangeFox recovery image not found"
               exit 1
             fi
+
+            zip -j "$ZIP_FILE" "$RECOVERY_IMG"
           else
-            if ls "$OUT_DIR"/*.img 1>/dev/null 2>&1; then
-              cp "$OUT_DIR"/*.img "$GITHUB_WORKSPACE/artifacts/"
-            else
-              echo "No images produced for $RECOVERY"
+            if ! ls "$OUT_DIR"/*.img >/dev/null 2>&1; then
+              echo "No images produced"
               exit 1
             fi
+
+            zip -j "$ZIP_FILE" "$OUT_DIR"/*.img
           fi
 
-      - name: Upload artifact
-        if: hashFiles('artifacts/*.img') != ''
+      - name: Upload recovery artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.recovery }}-recovery
-          path: artifacts/*.img
-
-  collect_release:
-    runs-on: ubuntu-latest
-    needs: build
-    if: always()
-    permissions:
-      contents: write
-    steps:
-      - name: Set release tag
-        id: tag
-        run: echo "tag=recovery-$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_recoveries
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "INOI A75 Recoveries ${{ steps.tag.outputs.tag }}"
-          body: "Automated release — failed recoveries are omitted."
-          files: all_recoveries/**/*.img
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: INOI_A75-${{ github.event.inputs.recovery_type }}
+          path: artifacts/*.zip
