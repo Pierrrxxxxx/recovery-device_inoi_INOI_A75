@@ -5,7 +5,7 @@
 #
 
 # Inherit from INOI_A75 device
-$(call inherit-product, device/inoi/INOI_A75/device.mk)
+$(call inherit-product, device/INOI/INOI_A75/device.mk)
 
 # Inherit some common PBRP stuff.
 $(call inherit-product, vendor/pb/config/common.mk)
